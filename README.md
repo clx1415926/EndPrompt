@@ -2,11 +2,9 @@
 
 This repository contains the experimental code for **“EndPrompt: Efficient Long-Context Extension via Terminal Anchoring”**. EndPrompt simulates long-context positional supervision with short physical sequences: it keeps the original short text as the first segment, appends a short terminal prompt as the second segment, and assigns the terminal segment position indices near the target context boundary. This exposes long-range RoPE relative-position relationships without full-length sequence training.
 
-Paper PDF: `./_NIPS2026_EndPrompt (1).pdf`
-
 ## Key Findings
 
-- EndPrompt extends context length using short training sequences, avoiding the high memory and compute cost of full-length fine-tuning.
+- EndPrompt extends context length using short training sequences, avoiding the high memory and compute cost of full-length fine-tuning
 - The method preserves the continuity of the original context while using a terminal prompt as an anchor for long-range positional supervision.
 - The theoretical analysis is based on RoPE and Position Interpolation, showing that sparse long-range supervision can generalize to unobserved intermediate distances through smooth positional variation and shared Transformer parameters.
 - On LLaMA-family models, the paper extends the context window from 8K to 64K and reports an average RULER score of 76.03, with the best average performance on LongBench.
