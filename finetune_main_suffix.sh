@@ -1,17 +1,15 @@
 #!/bin/bash
-# ----------------- EndPrompt (ET) main training entry (DASFAA 2027 scheme) -----------------
+# ----------------- EndPrompt (ET) main training entry -----------------
 # Physical input: 8182 context tokens + 10 cue tokens (EP_1) = 8192 tokens.
 # Logical window: 65536 with linear PI (s = 8); the cue offset Delta is sampled from
 # the precomputed D-optimal cumulative table (skip_design/gate1_w1_p_star_cdf.npy).
 RECIPE_NAME=suffix
-METHOD_NAME=pi # option:[origin, pi, ntk, yarn]
 TRAINING_LENGTH=8192           # physical input length (a + b)
 TARGET_LENGTH=65536            # logical target window L
-WANDB_NAME=${RECIPE_NAME}_${METHOD_NAME}_${TARGET_LENGTH}
+WANDB_NAME=${RECIPE_NAME}_${TARGET_LENGTH}
 
 CHUNK_2_LENGTH=10              # cue token count b (EP_1 tokenizes to 10 tokens)
 CUE_TEXT="This is the end of text, please pay attention here"
-SKIP_MODE=doptimal             # offset sampling: doptimal | uniform | fixed_max
 SKIP_CDF=skip_design/gate1_w1_p_star_cdf.npy
 
 torchrun  --nproc_per_node=8 \
@@ -21,8 +19,6 @@ torchrun  --nproc_per_node=8 \
         --output_dir ./ckpts/${RECIPE_NAME}/${WANDB_NAME} \
         --model_max_length ${TRAINING_LENGTH} \
         --target_length ${TARGET_LENGTH} \
-        --use_flash_attn True \
-        --low_rank_training False \
         --num_train_epochs 1 \
         --per_device_train_batch_size 4 \
         --per_device_eval_batch_size 4 \
@@ -40,13 +36,8 @@ torchrun  --nproc_per_node=8 \
         --logging_steps 3     \
         --tf32 True \
         --report_to "none" \
-        --use_wandb False \
         --dataset_dir /path/to/slim_8k_1b_llama3_converted.jsonl \
-        --method_name ${METHOD_NAME} \
-        --data_processing_mode "et" \
         --pose_chunk2_length ${CHUNK_2_LENGTH} \
         --pose_final_position_id 65535 \
         --et_cue_text "${CUE_TEXT}" \
-        --et_skip_mode ${SKIP_MODE} \
-        --et_skip_cdf ${SKIP_CDF} \
-        --wandb_name ${WANDB_NAME}
+        --et_skip_cdf ${SKIP_CDF}

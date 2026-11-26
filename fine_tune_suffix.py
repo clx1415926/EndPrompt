@@ -8,13 +8,10 @@ import numpy as np
 import torch
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer, DataCollatorForLanguageModeling
-from peft import LoraConfig, get_peft_model
+from transformers import Trainer
 from torch.distributed import barrier
-import wandb
 
-
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -24,76 +21,37 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 @dataclass
 class ModelArguments:
     dataset_dir: Optional[str] = field(default=None)
-    method_name: Optional[str] = field(default="pi") # pi, ntk-dynamic, longlora, longlora-ft, yarn, landmark
     model_name_or_path: Optional[str] = field(default="")
-    model_type: Optional[str] = field(default="llama")
-    scaling_type: Optional[str] = field(default="linear")
-    scaling_factor: Optional[int] = field(default=1)
-    use_wandb: bool = field(
-        default=False,
+    target_length: int = field(
+        default=65536,
+        metadata={"help": "逻辑目标窗口 L;决定 RoPE 配置 (PI scale = ceil(L / 模型原窗口))。"}
     )
-    wandb_name: str = field(
-        default='test',
-    )
-    # ------------------ 修改后的参数 ------------------
-    data_processing_mode: str = field(
-        default="default",
-        metadata={"help": "数据处理模式: 'default' (连续), 'pose_fixed_split' (不连续, 旧方案), or 'et' (最终方案)"}
-    )
-    # 将 split_index 替换为 chunk2_length
     pose_chunk2_length: int = field(
-        default=-1,
-        metadata={"help": "用于 PoSE 模式的第二块的固定长度 (例如: 20)，从序列末尾计算"}
+        default=10,
+        metadata={"help": "terminal cue 的 token 数 b (EP_1 分词后, 默认 10)。"}
     )
     pose_final_position_id: int = field(
-        default=32767,
-        metadata={"help": "序列中最后一个 token 对应的 position_id"}
-    )
-    # ------------------ ET (最终方案) 参数 ------------------
-    target_length: int = field(
-        default=-1,
-        metadata={"help": "逻辑目标窗口 L (默认 65536);决定 RoPE 配置, physical 输入仍由 model_max_length 决定。-1 表示使用 model_max_length"}
+        default=65535,
+        metadata={"help": "目标窗口内最后一个位置 (L-1)。"}
     )
     et_cue_text: str = field(
         default="This is the end of text, please pay attention here",
-        metadata={"help": "固定的 terminal cue 文本 (论文默认 EP_1);需恰好分词为 pose_chunk2_length 个 token"}
+        metadata={"help": "固定的 terminal cue 文本 (论文默认 EP_1);需恰好分词为 pose_chunk2_length 个 token。"}
     )
     et_skip_cdf: str = field(
-        default="",
-        metadata={"help": "D-optimal 偏移分布的累积概率表 (npy, 单调不减, 末项为 1.0);skip_mode=doptimal 时必填"}
+        default="skip_design/gate1_w1_p_star_cdf.npy",
+        metadata={"help": "D-optimal 偏移分布的累积概率表 (npy, 单调不减, 末项为 1.0, 长度为 L-a-b+1)。"}
     )
-    et_skip_mode: str = field(
-        default="doptimal",
-        metadata={"help": "'et' 模式的偏移采样方式: 'doptimal' (从 et_skip_cdf 逆 CDF 采样), 'uniform', 'fixed_max' (消融)"}
-    )
-    # ----------------------------------------------
 
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=8192 * 4,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
+        default=8192,
+        metadata={"help": "物理输入长度 (context a + cue b); 逻辑窗口由 --target_length 决定。"},
     )
-    use_flash_attn: bool = field(
-        default=True,
-        metadata={"help": "Whether use flash attention for training."},
-    )
-    use_full_attn: bool = field(
-        default=False,
-        metadata={"help": "Whether to use plain, full-attention for training."},
-    )
-    low_rank_training: bool = field(
-        default=False,
-        metadata={"help": "Whether use low rank adaptation for training."},
-    )
-    trainable_params: str = field(
-        default="embed,norm",
-        metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
-    )
-    mem_freq: int = field(default=63)
+
 
 # ------------------ (DataCollatorForSupervisedDataset 保持不变) ------------------
 @dataclass
@@ -147,68 +105,12 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-# ------------------ 针对您的场景更新的预处理函数 ------------------
-def preprocess_fixed_split_pose(example, tokenizer, max_length, chunk2_length, final_pos_id):
-    """
-    根据固定的 'chunk2_length' (从末尾计算) 创建不连续的 position_ids。
-    假设 'example' 已经有一个 'input_ids' 字段。
-    """
-    # 1. 获取 input_ids 并截断到最大长度
-    input_ids = example['input_ids']
-    if len(input_ids) > max_length:
-        input_ids = input_ids[:max_length]
-    
-    current_length = len(input_ids)
-    
-    # 2. 验证 chunk2_length 是否有效
-    if chunk2_length <= 0 or chunk2_length >= current_length:
-        # 如果 chunk2_length 无效 (例如, 序列太短),
-        # 作为后备，创建连续的 position_ids
-        print(f"警告: chunk2_length {chunk2_length} 对序列长度 {current_length} 无效。将使用连续 position_ids。")
-        position_ids = list(range(current_length))
-        labels = list(input_ids)
-        return {"input_ids": input_ids, "labels": labels, "position_ids": position_ids}
-
-    # 3. 根据 chunk2_length 计算分割点
-    split_index = current_length - chunk2_length
-    chunk1_len = split_index
-    # ( chunk2_len 已经由参数传入 )
-    
-    # 4. 生成不连续的 position_ids
-    position_ids = []
-    
-    # 块 1: [0, 1, ..., split_index - 1]
-    if chunk1_len > 0:
-        position_ids.extend(list(range(chunk1_len)))
-    
-    # 块 2: [..., final_pos_id]
-    # 计算块2的起始 position_id
-    # 例如: final_pos_id=32767, chunk2_length=20
-    # start_pos = 32767 - 20 + 1 = 32758
-    # 范围: [32758, ..., 32767] (长度为 20)
-    chunk2_start_pos = final_pos_id - chunk2_length + 1
-    position_ids.extend(list(range(chunk2_start_pos, final_pos_id + 1)))
-    
-    # 5. 创建 labels (与 input_ids 相同)
-    labels = list(input_ids)
-    
-    # 6. 健全性检查
-    assert len(input_ids) == len(position_ids) == len(labels), \
-        f"长度不匹配: input_ids={len(input_ids)}, position_ids={len(position_ids)}, labels={len(labels)}"
-    
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "position_ids": position_ids
-    }
-# ---------------------------------------------------------------
-
 # ------------------ ET (最终方案) 样本构造 ------------------
-def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, skip_cdf, skip_mode, base_seed):
+def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, skip_cdf, base_seed):
     """
     按论文构造 ET 训练样本: 完整短 context 后接固定的 terminal cue,
     仅对 cue 做整块位置偏移 (p_l = l for l<a; p_l = l+Delta for a<=l<a+b),
-    偏移 Delta 从 D-optimal 分布 (逆 CDF) 或均匀/固定最大中采样。
+    偏移 Delta 从 D-optimal 分布的累积表逆 CDF 采样。
     """
     input_ids = example['input_ids']
     if isinstance(input_ids, torch.Tensor):
@@ -220,17 +122,8 @@ def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, s
     b = len(cue_ids)
     delta_max = final_pos_id + 1 - context_length - b  # L - a - b
     rng = np.random.default_rng((base_seed + idx) % (2**32))
-    if skip_mode == "doptimal":
-        if skip_cdf is None:
-            raise ValueError("--skip_mode doptimal 需要设置 --et_skip_cdf")
-        delta = int(np.searchsorted(skip_cdf, float(rng.random()), side="right"))
-        delta = min(delta, delta_max)
-    elif skip_mode == "uniform":
-        delta = int(rng.integers(0, delta_max + 1))
-    elif skip_mode == "fixed_max":
-        delta = delta_max
-    else:
-        raise ValueError(f"未知的 --et_skip_mode: {skip_mode}")
+    delta = int(np.searchsorted(skip_cdf, float(rng.random()), side="right"))
+    assert 0 <= delta <= delta_max, f"采样的偏移越界: delta={delta}, delta_max={delta_max}"
 
     seq = context + list(cue_ids)
     position_ids = list(range(context_length))
@@ -239,177 +132,31 @@ def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, s
 # ---------------------------------------------------------------
 
 
-# 这是原始的 tokenize_fn，用于 'default' 模式
-def tokenize_fn(tokenizer, example):
-    context_length = tokenizer.model_max_length
-    outputs = tokenizer(
-        tokenizer.eos_token.join(example["text"]),
-        truncation=False,
-        return_tensors="pt",
-        pad_to_multiple_of=context_length,
-        padding=True,
-    )
-    return {"input_ids": outputs["input_ids"].view(-1, context_length)}
-
-
-
-def reshape_fn(tokenizer, examples):
-    context_length = tokenizer.model_max_length
-    examples['input_ids']=torch.tensor(examples['input_ids'])
-    return {'input_ids': examples['input_ids'].view(-1, context_length)}
-
-
-def add_mem_tokens(example, mem_freq, mem_id):
-    x = example["input_ids"]
-    ret = []
-    prev_idx = 0
-    for t_idx in range(mem_freq, len(x), mem_freq):
-        ret.extend(x[prev_idx:t_idx])
-        ret.append(mem_id)
-        prev_idx = t_idx
-    ret.extend(x[prev_idx:])
-    # drop attention_mask
-    return {"input_ids": ret}
-
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
     
-    # --- 模型加载逻辑 (与PI/NTK/YaRN相关, 保持不变) ---
-    if model_args.method_name == "pi":
-        from models.modeling_llama import LlamaForCausalLM
-        print('training pi')
-        # Set RoPE scaling factor
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.model_name_or_path
-        )
-        context_size = training_args.model_max_length
-        # ET: the logical window L drives the RoPE config; the physical input stays short.
-        rope_target = model_args.target_length if model_args.target_length > 0 else context_size
-        orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models, 8192 for LLaMA3 models
-        config.max_position_embeddings = rope_target
-        
-        if orig_ctx_len and rope_target > orig_ctx_len:
-            scaling_factor = float(math.ceil(rope_target / orig_ctx_len))
-            config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, rope_target: {rope_target}", flush=True)
-        model = LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-            cache_dir=training_args.cache_dir,
-            use_flash_attention_2=True,
-            torch_dtype=torch.bfloat16,
-        )
-    elif model_args.method_name == "ntk":
-        print('training ntk-dynamic')
-        # Set RoPE scaling factor
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.model_name_or_path
-        )
-        context_size = training_args.model_max_length
-        from models.modeling_llama import LlamaForCausalLM
-        orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models, 8192 for LLaMA3 models
-        rope_target = model_args.target_length if model_args.target_length > 0 else context_size
-        if orig_ctx_len and rope_target > orig_ctx_len:
-            # set the ntk-dynamic half the scale
-            scaling_factor = float(math.ceil(rope_target / orig_ctx_len / 2))
-            config.rope_scaling = {"type": "dynamic", "factor": scaling_factor}
-            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, rope_target: {rope_target}", flush=True)
-        config.max_position_embeddings = rope_target
-        model = LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-            cache_dir=training_args.cache_dir,
-            use_flash_attention_2=True,
-            torch_dtype=torch.bfloat16,
-        )
-
-    elif model_args.method_name == "yarn":
-        print('training yarn')
-        from models.modeling_llama import LlamaForCausalLM
-        from models.llama_yarn.configuration_llama import LlamaConfig
-        config_cls = LlamaConfig
-        model_cls = LlamaForCausalLM
-        config = config_cls.from_pretrained(model_args.model_name_or_path)
-        # Detect original max position embeddings from config (4096 for Llama2, 8192 for Llama3)
-        original_max_position_embeddings = getattr(config, "max_position_embeddings", 4096)
-        # Preserve original rope_theta if exists (10000 for Llama2, 500000 for Llama3)
-        original_rope_theta = getattr(config, "rope_theta", 10000)
-        context_size = training_args.model_max_length
-        scaling_factor = float(math.ceil(context_size / original_max_position_embeddings))
-        config.rope_scaling = {
-            "type": "yarn",
-            "factor": scaling_factor,
-            "original_max_position_embeddings": original_max_position_embeddings
-        }
-        config.rope_theta = original_rope_theta  # Use original rope_theta from model config
-        config.max_position_embeddings = training_args.model_max_length
-        print(f"YaRN config: scaling_factor={scaling_factor}, original_max_pos={original_max_position_embeddings}, rope_theta={config.rope_theta}", flush=True)
-
-        model = model_cls.from_pretrained(
-            model_args.model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            config=config,
-            use_flash_attention_2=True
-        )
-    elif model_args.method_name == "longlora":
-        # replace sparse shift attention for longlora
-        from models.llama_longlora.llama_attn_replace import replace_llama_attn
-        if training_args.low_rank_training:
-            print('training longlora with lora and sparse shift attention')
-        else:
-            print('training longlora with full-finetuning and sparse shift attention')
-        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
-                # Set RoPE scaling factor
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.model_name_or_path
-        )
-        context_size = training_args.model_max_length
-        orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models, 8192 for LLaMA3 models
-        if orig_ctx_len and context_size > orig_ctx_len:
-            scaling_factor = float(math.ceil(context_size / orig_ctx_len))
-            config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, context_size: {context_size}", flush=True)
-        
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-            cache_dir=training_args.cache_dir,
-            torch_dtype=torch.bfloat16,
-        )
-
-        # use lora with "embed,norm" or use fullfinetuning
-        if training_args.low_rank_training:
-            targets=["q_proj", "k_proj", "v_proj", "o_proj"]
-
-            config = LoraConfig(
-                r=8,
-                lora_alpha=16,
-                target_modules=targets,
-                lora_dropout=0,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, config)
-            # enable trainable params
-            [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
-    elif model_args.method_name == "landmark":
-        from models.llama_landmark.llama_mem import LlamaForCausalLM
-        model = LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            mem_freq=training_args.mem_freq,
-            include_landmark_in_loss=True
-        )
-    elif model_args.method_name == "origin":
-        print('training origin llama')
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            use_flash_attention_2=True,
-            torch_dtype=torch.bfloat16,
-        )
+    # --- 模型加载 (linear PI, 与论文一致) ---
+    from models.modeling_llama import LlamaForCausalLM
+    print('training pi')
+    config = transformers.AutoConfig.from_pretrained(
+        model_args.model_name_or_path
+    )
+    orig_ctx_len = getattr(config, "max_position_embeddings", None)  # 原窗口 (LLaMA-3: 8192)
+    config.max_position_embeddings = model_args.target_length
+    if orig_ctx_len and model_args.target_length > orig_ctx_len:
+        scaling_factor = float(math.ceil(model_args.target_length / orig_ctx_len))
+        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+    print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, target_length: {model_args.target_length}", flush=True)
+    model = LlamaForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        cache_dir=training_args.cache_dir,
+        use_flash_attention_2=True,
+        torch_dtype=torch.bfloat16,
+    )
     
-    # --- (Tokenizer 和 Special Tokens 逻辑保持不变) ---
+    # --- Tokenizer ---
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -419,32 +166,8 @@ def train():
     )
 
     special_tokens_dict = dict()
-    
-    # 检测模型类型（Llama3词汇表>100K）
-    is_llama3 = len(tokenizer) > 100000
-    
-    if is_llama3:
-        # Llama3：只添加PAD token，保留原生BOS/EOS
-        if tokenizer.pad_token is None:
-            special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-        print(f"✓ 检测到Llama3 (vocab_size={len(tokenizer)})")
-        print(f"  保留原生BOS: {tokenizer.bos_token}")
-        print(f"  保留原生EOS: {tokenizer.eos_token}")
-    else:
-        # Llama2：使用传统逻辑
-        if tokenizer.pad_token is None:
-            special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-        if tokenizer.eos_token is None:
-            special_tokens_dict["eos_token"] = "</s>"
-        if tokenizer.bos_token is None:
-            special_tokens_dict["bos_token"] = "<s>"
-        if tokenizer.unk_token is None:
-            special_tokens_dict["unk_token"] = "<unk>"
-        print(f"✓ 检测到Llama2 (vocab_size={len(tokenizer)})")
-    
-    if model_args.method_name == "landmark":
-        mem_token = "<landmark>"
-        special_tokens_dict["additional_special_tokens"] = [mem_token]
+    if tokenizer.pad_token is None:
+        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
 
     smart_tokenizer_and_embedding_resize(
         special_tokens_dict=special_tokens_dict,
@@ -453,178 +176,75 @@ def train():
     )
     
     # 验证tokenizer配置
-    print("\n" + "="*60)
-    print("📋 Tokenizer配置验证")
-    print("="*60)
-    print(f"词汇表大小: {len(tokenizer)}")
-    print(f"BOS token: '{tokenizer.bos_token}' (ID: {tokenizer.bos_token_id})")
-    print(f"EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
-    print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
-    if tokenizer.unk_token:
-        print(f"UNK token: '{tokenizer.unk_token}' (ID: {tokenizer.unk_token_id})")
-    print(f"新增特殊token数: {len(special_tokens_dict)}")
-    print("="*60 + "\n")
-    
-    # Llama3词汇表检查
-    if is_llama3 and len(tokenizer) != 128257:
-        print(f"⚠️  警告：Llama3词汇表大小异常！预期128257，实际{len(tokenizer)}")
-    # --- (Barrier 和 load_dataset 逻辑保持不变) ---
+    print(f"词汇表大小: {len(tokenizer)}; PAD token: {tokenizer.pad_token} (ID: {tokenizer.pad_token_id})")
+
+    # --- 数据加载 ---
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
 
-    dataset = load_dataset('json',data_files=model_args.dataset_dir,)
-    
+    dataset = load_dataset('json', data_files=model_args.dataset_dir)
     
     if rank == 0:
         barrier()
 
     print(dataset)
     
-    # ------------------ 修改的数据处理和收集器逻辑 ------------------
+    # --- ET 样本构造 ---
+    if model_args.pose_chunk2_length <= 0:
+        raise ValueError("'--pose_chunk2_length' 需为正数 (cue 的 token 数, 默认 10)。")
+    if "input_ids" not in dataset['train'].column_names:
+        raise ValueError("数据集中需要 'input_ids' 字段 (预分词)。")
 
-    # 根据传入的参数选择数据处理方式
-    if model_args.data_processing_mode == "pose_fixed_split":
-        print(f"使用 'pose_fixed_split' 数据处理模式。")
-        # 更新: 打印 chunk2_length
-        print(f"  Chunk 2 Length (from end): {model_args.pose_chunk2_length}")
-        print(f"  Final Position ID: {model_args.pose_final_position_id}")
-        
-        # 更新: 检查 chunk2_length
-        if model_args.pose_chunk2_length <= 0:
-            raise ValueError("'pose_fixed_split' 模式需要设置 '--pose_chunk2_length' 为正数 (例如 20)。")
-        
-        # 假设数据集已有 'input_ids' 字段
-        if "input_ids" not in dataset['train'].column_names:
-            raise ValueError("'pose_fixed_split' 模式需要数据集中有 'input_ids' 字段。")
-            
-        column_names = dataset['train'].column_names
-        
-        dataset = dataset.map(
-            partial(
-                # 更新: 传递新参数
-                preprocess_fixed_split_pose, 
-                tokenizer=tokenizer, 
-                max_length=training_args.model_max_length,
-                chunk2_length=model_args.pose_chunk2_length,
-                final_pos_id=model_args.pose_final_position_id
-            ),
-            batched=False, # 我们的函数一次处理一个样本
-            num_proc=8, # 可以根据需要调整
-            remove_columns=column_names # 移除所有旧字段，只保留新字段
+    cue_ids = tokenizer(model_args.et_cue_text, add_special_tokens=False)["input_ids"]
+    if len(cue_ids) != model_args.pose_chunk2_length:
+        raise ValueError(
+            f"cue 文本分词为 {len(cue_ids)} 个 token, 与 --pose_chunk2_length={model_args.pose_chunk2_length} 不符。"
+            f"请调整 --et_cue_text 或 --pose_chunk2_length, 并确保 skip 表按 (a, b) 重新计算。"
         )
-        # 使用新的数据收集器
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        
-    elif model_args.data_processing_mode == "et":
-        print("使用 'et' 数据处理模式 (固定 terminal cue + 偏移采样)。")
-        if model_args.pose_chunk2_length <= 0:
-            raise ValueError("'et' 模式需要设置 '--pose_chunk2_length' 为 cue 的 token 数 (默认 10)。")
-        if "input_ids" not in dataset['train'].column_names:
-            raise ValueError("'et' 模式需要数据集中有 'input_ids' 字段 (预分词)。")
+    context_length = training_args.model_max_length - model_args.pose_chunk2_length
+    if context_length < 1:
+        raise ValueError("--model_max_length 必须大于 --pose_chunk2_length。")
 
-        cue_ids = tokenizer(model_args.et_cue_text, add_special_tokens=False)["input_ids"]
-        if len(cue_ids) != model_args.pose_chunk2_length:
-            raise ValueError(
-                f"cue 文本分词为 {len(cue_ids)} 个 token, 与 --pose_chunk2_length={model_args.pose_chunk2_length} 不符。"
-                f"请调整 --et_cue_text 或 --pose_chunk2_length, 并确保 skip 表按 (a, b) 重新计算。"
-            )
-        context_length = training_args.model_max_length - model_args.pose_chunk2_length
-        if context_length < 1:
-            raise ValueError("--model_max_length 必须大于 --pose_chunk2_length。")
-        skip_cdf = None
-        if model_args.et_skip_mode == "doptimal":
-            if not model_args.et_skip_cdf:
-                raise ValueError("--skip_mode doptimal 需要设置 --et_skip_cdf")
-            skip_cdf = np.load(model_args.et_skip_cdf)
-            if skip_cdf.ndim != 1 or skip_cdf[-1] != 1.0 or (np.diff(skip_cdf) < 0).any():
-                raise ValueError("--et_skip_cdf 应为单调不减且末项为 1 的一维累积概率表。")
-        print(f"  Context: {context_length} tokens, Cue: {len(cue_ids)} tokens, "
-              f"skip_mode={model_args.et_skip_mode}, final_pos_id={model_args.pose_final_position_id}")
-        print(f"  Cue text: '{model_args.et_cue_text}'")
-
-        column_names = dataset['train'].column_names
-        dataset = dataset.map(
-            partial(
-                preprocess_et,
-                cue_ids=cue_ids,
-                context_length=context_length,
-                pad_id=tokenizer.pad_token_id,
-                final_pos_id=model_args.pose_final_position_id,
-                skip_cdf=skip_cdf,
-                skip_mode=model_args.et_skip_mode,
-                base_seed=training_args.seed,
-            ),
-            with_indices=True,
-            batched=False,
-            num_proc=8,
-            remove_columns=column_names,
+    skip_cdf = np.load(model_args.et_skip_cdf)
+    delta_max = model_args.pose_final_position_id + 1 - context_length - len(cue_ids)
+    if skip_cdf.ndim != 1 or skip_cdf.shape[0] != delta_max + 1 or skip_cdf[-1] != 1.0 or (np.diff(skip_cdf) < 0).any():
+        raise ValueError(
+            f"--et_skip_cdf 应为长度 {delta_max + 1}、单调不减且末项为 1 的一维累积概率表。"
         )
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        
-    elif model_args.method_name == "landmark":
-        print("使用 'landmark' 数据处理模式。")
-        mem_id = tokenizer.convert_tokens_to_ids(mem_token)
-        model.set_mem_id(mem_id)
-        remove_columns = [col for col in dataset['train'].column_names if col != 'input_ids']
-        dataset = dataset.map(partial(reshape_fn,tokenizer),batched=True, num_proc=8, remove_columns=remove_columns)
-        dataset = dataset.map(
-            partial(
-                add_mem_tokens, 
-                mem_freq=training_args.mem_freq, 
-                mem_id=mem_id
-            ), batched=False, num_proc=8)
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-        
-    else: # 默认的、连续的
-        print("使用 'default' 数据处理模式 (标准 tokenization)。")
-        if "text" not in dataset['train'].column_names:
-            raise ValueError("Default 模式需要数据集中有 'text' 字段。")
-            
-        dataset = dataset.map(
-            partial(tokenize_fn, tokenizer),
-            batched=True,
-            num_proc=8,
-            remove_columns=["text"]
-        )
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    print(f"  Context: {context_length} tokens, Cue: {len(cue_ids)} tokens, "
+          f"target L: {model_args.pose_final_position_id + 1}, delta_max: {delta_max}")
+    print(f"  Cue text: '{model_args.et_cue_text}'")
 
-    # -------------------------------------------------------------
-        
-    # --- (Wandb, Gradient Checkpointing, Trainer 逻辑保持不变) ---
-    if model_args.use_wandb:
-        project_name = f'long_extension'
-        wandb.init(project=project_name, entity='', name=model_args.wandb_name, sync_tensorboard=False,
-                job_type="CleanRepo", group=model_args.wandb_name)
+    column_names = dataset['train'].column_names
+    dataset = dataset.map(
+        partial(
+            preprocess_et,
+            cue_ids=cue_ids,
+            context_length=context_length,
+            pad_id=tokenizer.pad_token_id,
+            final_pos_id=model_args.pose_final_position_id,
+            skip_cdf=skip_cdf,
+            base_seed=training_args.seed,
+        ),
+        with_indices=True,
+        batched=False,
+        num_proc=8,
+        remove_columns=column_names,
+    )
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
-    
-    if model_args.method_name != "landmark":
-        model.config.use_cache = False         # required for gradient checkpointing
-        # model.enable_input_require_grads()     # required for gradient checkpointing
-        # model.gradient_checkpointing_enable()  # enable gradient checkpointing
+    # --- 训练 ---
+    model.config.use_cache = False  # required for gradient checkpointing
     
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args,
         train_dataset=dataset['train'],
         eval_dataset=None,
-        data_collator=data_collator) # <-- collator 已经被正确设置
+        data_collator=data_collator)
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
-    
-    # --- (LongLoRA 保存逻辑保持不变) ---
-    if model_args.method_name == "longlora" and training_args.low_rank_training:
-        print('saveing pytorch_model.bin with lora')
-        save_finetuned_model_dir = os.path.join(training_args.output_dir, 'finetuned_model')
-        if save_finetuned_model_dir is not None:
-            os.makedirs(save_finetuned_model_dir, exist_ok=True)
-        model.base_model.save_pretrained(save_finetuned_model_dir)
-        # save merged model
-        model = model.merge_and_unload()
-        save_finetuned_model_merged_dir = os.path.join(training_args.output_dir, 'finetuned_model_merged')
-        if save_finetuned_model_merged_dir is not None:
-            os.makedirs(save_finetuned_model_merged_dir, exist_ok=True)
-        model.save_pretrained(save_finetuned_model_merged_dir)
 
 
 if __name__ == "__main__":
