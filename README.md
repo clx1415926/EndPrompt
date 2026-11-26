@@ -1,14 +1,15 @@
 # EndPrompt
 
-This repository contains the experimental code for **“EndPrompt: Efficient Long-Context Extension via Terminal Anchoring”**. EndPrompt simulates long-context positional supervision with short physical sequences: it keeps the original short text as the first segment, appends a short terminal prompt as the second segment, and assigns the terminal segment position indices near the target context boundary. This exposes long-range RoPE relative-position relationships without full-length sequence training.
+This repository contains the experimental code for **“EndPrompt: Efficient Context Window Extension via Optimally Shifted Terminal Cue”** (DASFAA 2027 submission). EndPrompt (ET) introduces long-range positional supervision with short training sequences: it keeps an intact short context as the first segment, appends a fixed terminal cue, and shifts only the cue's positional indices by a blockwise offset drawn from an offline D-optimal design over RoPE features. This exposes long-range RoPE relative-position relationships without processing target-length inputs.
 
 ## Key Findings
 
-- EndPrompt extends context length using short training sequences, avoiding the high memory and compute cost of full-length fine-tuning
-- The method preserves the continuity of the original context while using a terminal prompt as an anchor for long-range positional supervision.
-- The theoretical analysis is based on RoPE and Position Interpolation, showing that sparse long-range supervision can generalize to unobserved intermediate distances through smooth positional variation and shared Transformer parameters.
-- On LLaMA-family models, the paper extends the context window from 8K to 64K and reports an average RULER score of 76.03, with the best average performance on LongBench.
-- Compared with LCEG, LongLoRA, and full-length fine-tuning, EndPrompt achieves comparable or better performance with substantially lower training cost.
+- Fine-tuning with 8K training inputs extends LLaMA-3-8B from 8K to 64K: **81.39** average RULER (13 tasks, averaged over 4K–64K evaluations) and **39.03** on LongBench (16 English tasks), using 1B LCEG training tokens and one epoch.
+- ET beats PoSE (79.31 / 37.95), RandPos (48.34 / 32.59), LCEG (72.24 / 36.61), LongLoRA (72.95 / 36.84), and full-length fine-tuning (69.23 / 35.63) on the same 64K setting.
+- The method transfers to Mistral-7B-v0.3 (72.39 RULER / 37.29 LongBench) by recomputing the offset table from the corresponding RoPE frequencies.
+- At the 64K target, ET uses 36.52 GB of peak training memory, 52% less than full-length fine-tuning, and trains 1.41x faster.
+- The D-optimal offset distribution adds 1.17 RULER / 0.56 LongBench points over uniform offset sampling; the fixed-maximum offset does worst, so spreading samples across the offset range matters.
+- After SFT on UltraChat-12K, the ET-adapted model averages 53.56 across MMLU, GSM8K, HellaSwag, and HumanEval (PoSE: 52.32; full FT: 50.98).
 
 ## Repository Structure
 
@@ -16,21 +17,29 @@ This repository contains the experimental code for **“EndPrompt: Efficient Lon
 ./
 ├── README.md
 ├── requirements.txt
-├── fine_tune_suffix.py
-├── finetune_main_suffix.sh
-├── finetune_suffix_random.py
-├── fine-tune.py
-├── fine_tune_new.py
-├── fine_tune_half.py
-├── fine_tune_half_new.py
-├── occu.py
+├── fine_tune_suffix.py          # core ET training script (final scheme, mode "et")
+├── finetune_main_suffix.sh      # main LLaMA-3-8B ET entry point (D-optimal offsets)
+├── finetune_main_suffix_random.sh  # uniform-offset ablation of the same construction
+├── fine_tune_new.py             # legacy: half-context self-distillation variant
+├── fine_tune_half.py            # legacy: half-context self-distillation variant
+├── fine_tune_half_new.py        # legacy: half-context continuation variant
+├── finetune_suffix_random.py    # legacy: random suffix-position training
+├── fine-tune.py                 # base long-context training (PI/NTK/YaRN/LongLoRA/Landmark)
+├── finetune.sh                  # legacy LLaMA-2 recipes
+├── finetune_suffix.sh           # legacy LLaMA-2 suffix / terminal-prompt example
+├── finetune_ntk_main.sh         # legacy LLaMA-2 NTK entry point
+├── finetune_ntk_main_new.sh     # legacy checkpoint-continuation NTK entry point
 ├── models/
-│   └── modeling_llama.py
+│   └── modeling_llama.py        # project-local LLaMA modeling (RoPE position_ids + linear PI)
 ├── ds_configs/
 │   ├── stage3.json
 │   └── stage3_offload.json
-├── LLAMA3_ADAPTATION_README.md
-└── ADAPTATION_CHECKLIST.md
+└── skip_design/
+    ├── gate1_doptimal.py        # offline D-optimal offset design (paper Appendix)
+    ├── gate1_w1_p_star.npy      # D-optimal offset distribution (LLaMA-3-8B, 8K->64K)
+    ├── gate1_w1_p_star_cdf.npy  # its cumulative probabilities (length 57345 = L-a-b+1)
+    ├── gate1_w1_summary.json    # design diagnostics (r=74, efficiency bounds, ...)
+    └── gate2_ggn_rank.py        # GGN rank-consistency check for the design surrogate
 ```
 
 ## Setup
@@ -45,7 +54,7 @@ pip install -r ./requirements.txt
 
 ### Recommended Entry Point
 
-The main training entry point referenced by the LLaMA3 8B adaptation notes is:
+The main ET training entry point is the DASFAA default configuration:
 
 ```bash
 bash ./finetune_main_suffix.sh
@@ -54,47 +63,51 @@ bash ./finetune_main_suffix.sh
 Default configuration in this script:
 
 ```text
-METHOD_NAME=pi
-TRAINING_LENGTH=65536
-CHUNK_2_LENGTH=18
-pose_final_position_id=65535
-model_name_or_path=Llama-3-8B
+MODEL_NAME_OR_PATH  = Llama-3-8B
+TRAINING_LENGTH     = 8192     # physical input: 8182 context + 10 cue tokens
+TARGET_LENGTH       = 65536    # logical target window L (RoPE config; s = 8 linear PI)
+CHUNK_2_LENGTH      = 10       # cue token count b (EP_1 below tokenizes to 10 tokens)
+CUE_TEXT            = "This is the end of text, please pay attention here"   # EP_1
+SKIP_MODE           = doptimal # offsets: doptimal | uniform | fixed_max
+SKIP_CDF            = skip_design/gate1_w1_p_star_cdf.npy
+DATASET             = pre-tokenized LCEG (jsonl with an "input_ids" field, ~8K-token sequences)
 ```
 
-Before running, update the model path, dataset path, output path, and DeepSpeed config path according to your local environment.
+Training details matched to the paper: all parameters fine-tuned, one epoch over the LCEG corpus (about 1B tokens), global batch 64 (4 per GPU, 2 accumulation steps, 8 A800 GPUs), learning rate 2e-5 constant after 20 warmup steps, no weight decay, BF16, DeepSpeed ZeRO-3, FlashAttention, and gradient checkpointing.
 
-### Training Script Status
+Before running, update the model path, dataset path, output path, and the DeepSpeed config path to your local environment. The dataset must be pre-tokenized and expose an `input_ids` field; the script asserts that the cue text tokenizes to exactly `CHUNK_2_LENGTH` tokens.
 
-- `finetune_main_suffix.sh`: Main LLaMA3 suffix training entry point. It uses `Llama-3-8B`.
-- `finetune_main_suffix_random.sh`: LLaMA3 random suffix-position training entry point. It also uses `Llama-3-8B`.
-- `finetune.sh`: Legacy LLaMA2 training examples for original LLaMA, PI, LongLoRA, and Landmark. It uses `Llama-2-7b-hf`.
-- `finetune_suffix.sh`: Legacy LLaMA2 suffix / terminal-prompt example. It uses `Llama-2-7b-hf`.
-- `finetune_ntk_main.sh`: Legacy LLaMA2 NTK entry point. It uses `Llama-2-7B-32k`.
-- `finetune_ntk_main_new.sh`: Continuation / checkpoint-based NTK-related entry point. It starts from `suffix_pi_32k` rather than a base LLaMA3 model.
+### Offset Sampling Ablations
 
-For LLaMA3 experiments, use `finetune_main_suffix.sh` by default. The other legacy scripts should be treated as LLaMA2 baselines or templates unless their `--model_name_or_path`, RoPE-related settings, dataset path, and output path are explicitly updated.
+- `finetune_main_suffix_random.sh`: identical construction with `--et_skip_mode uniform` (Delta uniform over [0, L-a-b]); the paper's uniform-offset ablation.
+- `--et_skip_mode fixed_max`: the paper's fixed-maximum-offset ablation (cue always at the window limit).
 
-## Key Scripts
+### Offset Design (skip_design)
 
-- `fine_tune_suffix.py`: Core EndPrompt / suffix training script, supporting data processing modes such as `pose_fixed_split` and RoPE scaling configuration.
-- `finetune_suffix_random.py`: Random terminal-prompt position variant.
-- `fine-tune.py`: Base long-context training script supporting PI, NTK, YaRN, LongLoRA, Landmark, and related methods.
-- `models/modeling_llama.py`: Project-local custom LLaMA modeling code.
-- `ds_configs/stage3.json`, `ds_configs/stage3_offload.json`: DeepSpeed ZeRO Stage 3 configurations.
-- `occu.py`: Utility script.
+The D-optimal table is configuration-specific. For a new (model, L, s, a, b) configuration, recompute it offline:
 
-## Data and Outputs
-
-Training scripts typically require:
-
-```text
-Model path: --model_name_or_path
-Dataset path: --dataset_dir
-Output path: --output_dir
-DeepSpeed config: --deepspeed
+```bash
+cd skip_design
+python gate1_doptimal.py --a0 8182 --b 10 --wcue 1.0 --rank_sensitivity --out_prefix gate1_w1
 ```
 
-The current shell scripts may contain cluster-specific paths. Replace them with local paths when migrating to a new environment.
+This reproduces the shipped LLaMA-3-8B 8K-to-64K table: r = 74 retained directions, uniform
+efficiency in [0.8889, 0.8898], and q-hat efficiency in [0.9990, 1.0]. `gate1_w1_p_star_cdf.npy`
+is the cumulative table used during training via `delta = np.searchsorted(cdf, u, side="right")`.
+`gate2_ggn_rank.py` is the auxiliary GGN rank-consistency check over the design surrogate; see the
+script docstring for the pre-registered protocol.
+
+## Training Script Status
+
+- `finetune_main_suffix.sh`: main LLaMA-3-8B ET entry point (D-optimal offsets, final scheme).
+- `finetune_main_suffix_random.sh`: uniform-offset ET ablation (final scheme construction).
+- `fine_tune_suffix.py`: core ET script; `data_processing_mode="et"` implements the final construction.
+- `finetune_suffix_random.py`: legacy random suffix-position variant (pre-table uniform sampling).
+- The remaining scripts are legacy LLaMA-2 baselines or templates (PI, NTK, YaRN, LongLoRA, Landmark) and should be treated as reference unless their paths and RoPE settings are updated explicitly.
+
+## Evaluation
+
+All checkpoints in the paper are evaluated with contiguous position indices and no appended cue: RULER (all samples of all 13 tasks at 4K, 8K, 16K, 32K, and 64K) and the 16 English LongBench tasks with the official prompts.
 
 ## Notes
 

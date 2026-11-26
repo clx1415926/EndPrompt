@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, Optional, Sequence
 
+import numpy as np
 import torch
 import transformers
 from torch.utils.data import Dataset
@@ -37,7 +38,7 @@ class ModelArguments:
     # ------------------ 修改后的参数 ------------------
     data_processing_mode: str = field(
         default="default",
-        metadata={"help": "数据处理模式: 'default' (连续) or 'pose_fixed_split' (不连续)"}
+        metadata={"help": "数据处理模式: 'default' (连续), 'pose_fixed_split' (不连续, 旧方案), or 'et' (最终方案)"}
     )
     # 将 split_index 替换为 chunk2_length
     pose_chunk2_length: int = field(
@@ -47,6 +48,23 @@ class ModelArguments:
     pose_final_position_id: int = field(
         default=32767,
         metadata={"help": "序列中最后一个 token 对应的 position_id"}
+    )
+    # ------------------ ET (最终方案) 参数 ------------------
+    target_length: int = field(
+        default=-1,
+        metadata={"help": "逻辑目标窗口 L (默认 65536);决定 RoPE 配置, physical 输入仍由 model_max_length 决定。-1 表示使用 model_max_length"}
+    )
+    et_cue_text: str = field(
+        default="This is the end of text, please pay attention here",
+        metadata={"help": "固定的 terminal cue 文本 (论文默认 EP_1);需恰好分词为 pose_chunk2_length 个 token"}
+    )
+    et_skip_cdf: str = field(
+        default="",
+        metadata={"help": "D-optimal 偏移分布的累积概率表 (npy, 单调不减, 末项为 1.0);skip_mode=doptimal 时必填"}
+    )
+    et_skip_mode: str = field(
+        default="doptimal",
+        metadata={"help": "'et' 模式的偏移采样方式: 'doptimal' (从 et_skip_cdf 逆 CDF 采样), 'uniform', 'fixed_max' (消融)"}
     )
     # ----------------------------------------------
 
@@ -185,6 +203,41 @@ def preprocess_fixed_split_pose(example, tokenizer, max_length, chunk2_length, f
     }
 # ---------------------------------------------------------------
 
+# ------------------ ET (最终方案) 样本构造 ------------------
+def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, skip_cdf, skip_mode, base_seed):
+    """
+    按论文构造 ET 训练样本: 完整短 context 后接固定的 terminal cue,
+    仅对 cue 做整块位置偏移 (p_l = l for l<a; p_l = l+Delta for a<=l<a+b),
+    偏移 Delta 从 D-optimal 分布 (逆 CDF) 或均匀/固定最大中采样。
+    """
+    input_ids = example['input_ids']
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.tolist()
+    if len(input_ids) < context_length:
+        input_ids = input_ids + [pad_id] * (context_length - len(input_ids))
+    context = input_ids[:context_length]
+
+    b = len(cue_ids)
+    delta_max = final_pos_id + 1 - context_length - b  # L - a - b
+    rng = np.random.default_rng((base_seed + idx) % (2**32))
+    if skip_mode == "doptimal":
+        if skip_cdf is None:
+            raise ValueError("--skip_mode doptimal 需要设置 --et_skip_cdf")
+        delta = int(np.searchsorted(skip_cdf, float(rng.random()), side="right"))
+        delta = min(delta, delta_max)
+    elif skip_mode == "uniform":
+        delta = int(rng.integers(0, delta_max + 1))
+    elif skip_mode == "fixed_max":
+        delta = delta_max
+    else:
+        raise ValueError(f"未知的 --et_skip_mode: {skip_mode}")
+
+    seq = context + list(cue_ids)
+    position_ids = list(range(context_length))
+    position_ids.extend(range(context_length + delta, context_length + delta + b))
+    return {"input_ids": seq, "labels": seq, "position_ids": position_ids}
+# ---------------------------------------------------------------
+
 
 # 这是原始的 tokenize_fn，用于 'default' 模式
 def tokenize_fn(tokenizer, example):
@@ -231,13 +284,15 @@ def train():
             model_args.model_name_or_path
         )
         context_size = training_args.model_max_length
+        # ET: the logical window L drives the RoPE config; the physical input stays short.
+        rope_target = model_args.target_length if model_args.target_length > 0 else context_size
         orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models, 8192 for LLaMA3 models
-        config.max_position_embeddings = context_size
+        config.max_position_embeddings = rope_target
         
-        if orig_ctx_len and context_size > orig_ctx_len:
-            scaling_factor = float(math.ceil(context_size / orig_ctx_len))
+        if orig_ctx_len and rope_target > orig_ctx_len:
+            scaling_factor = float(math.ceil(rope_target / orig_ctx_len))
             config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, context_size: {context_size}", flush=True)
+            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, rope_target: {rope_target}", flush=True)
         model = LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -254,12 +309,13 @@ def train():
         context_size = training_args.model_max_length
         from models.modeling_llama import LlamaForCausalLM
         orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models, 8192 for LLaMA3 models
-        if orig_ctx_len and context_size > orig_ctx_len:
+        rope_target = model_args.target_length if model_args.target_length > 0 else context_size
+        if orig_ctx_len and rope_target > orig_ctx_len:
             # set the ntk-dynamic half the scale
-            scaling_factor = float(math.ceil(context_size / orig_ctx_len / 2))
+            scaling_factor = float(math.ceil(rope_target / orig_ctx_len / 2))
             config.rope_scaling = {"type": "dynamic", "factor": scaling_factor}
-            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, context_size: {context_size}", flush=True)
-        config.max_position_embeddings = context_size
+            print(f"RoPE scaling config: {config.rope_scaling}, orig_ctx_len: {orig_ctx_len}, rope_target: {rope_target}", flush=True)
+        config.max_position_embeddings = rope_target
         model = LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -458,6 +514,52 @@ def train():
             remove_columns=column_names # 移除所有旧字段，只保留新字段
         )
         # 使用新的数据收集器
+        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+        
+    elif model_args.data_processing_mode == "et":
+        print("使用 'et' 数据处理模式 (固定 terminal cue + 偏移采样)。")
+        if model_args.pose_chunk2_length <= 0:
+            raise ValueError("'et' 模式需要设置 '--pose_chunk2_length' 为 cue 的 token 数 (默认 10)。")
+        if "input_ids" not in dataset['train'].column_names:
+            raise ValueError("'et' 模式需要数据集中有 'input_ids' 字段 (预分词)。")
+
+        cue_ids = tokenizer(model_args.et_cue_text, add_special_tokens=False)["input_ids"]
+        if len(cue_ids) != model_args.pose_chunk2_length:
+            raise ValueError(
+                f"cue 文本分词为 {len(cue_ids)} 个 token, 与 --pose_chunk2_length={model_args.pose_chunk2_length} 不符。"
+                f"请调整 --et_cue_text 或 --pose_chunk2_length, 并确保 skip 表按 (a, b) 重新计算。"
+            )
+        context_length = training_args.model_max_length - model_args.pose_chunk2_length
+        if context_length < 1:
+            raise ValueError("--model_max_length 必须大于 --pose_chunk2_length。")
+        skip_cdf = None
+        if model_args.et_skip_mode == "doptimal":
+            if not model_args.et_skip_cdf:
+                raise ValueError("--skip_mode doptimal 需要设置 --et_skip_cdf")
+            skip_cdf = np.load(model_args.et_skip_cdf)
+            if skip_cdf.ndim != 1 or skip_cdf[-1] != 1.0 or (np.diff(skip_cdf) < 0).any():
+                raise ValueError("--et_skip_cdf 应为单调不减且末项为 1 的一维累积概率表。")
+        print(f"  Context: {context_length} tokens, Cue: {len(cue_ids)} tokens, "
+              f"skip_mode={model_args.et_skip_mode}, final_pos_id={model_args.pose_final_position_id}")
+        print(f"  Cue text: '{model_args.et_cue_text}'")
+
+        column_names = dataset['train'].column_names
+        dataset = dataset.map(
+            partial(
+                preprocess_et,
+                cue_ids=cue_ids,
+                context_length=context_length,
+                pad_id=tokenizer.pad_token_id,
+                final_pos_id=model_args.pose_final_position_id,
+                skip_cdf=skip_cdf,
+                skip_mode=model_args.et_skip_mode,
+                base_seed=training_args.seed,
+            ),
+            with_indices=True,
+            batched=False,
+            num_proc=8,
+            remove_columns=column_names,
+        )
         data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
         
     elif model_args.method_name == "landmark":
