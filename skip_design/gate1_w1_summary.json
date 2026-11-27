@@ -6,14 +6,9 @@
   "D": 128,
   "a0": 8182,
   "b": 10,
-  "wcue": 1.0,
-  "eta": 0.95,
   "iters": 2000,
-  "solve_eta": false,
-  "bisect": 14,
-  "inner": 400,
   "rank_sensitivity": true,
-  "out_prefix": "gate1_w1"
+  "out_prefix": "/tmp/ep_check/gate1_w1"
  },
  "svd_residual": 3.659197602151678e-15,
  "sv_kept_min": 5.648081337205471e-05,
@@ -22,28 +17,23 @@
   "r": 74,
   "K": 57345,
   "f_p0": -459.90199965959295,
-  "fw_gap_p0": 358.3562909177051,
-  "step1_lower_bound": 0.007886107751552265,
   "f_lo": -451.25931958435416,
   "f_hi": -451.18549906467564,
   "iters": 291,
   "converged": true,
   "eff_lo": 0.8888822107596815,
-  "eff_hi": 0.8897693795017856,
-  "verdict": "non-uniform (go to step 4)"
+  "eff_hi": 0.8897693795017856
  },
  "rank_sensitivity": {
   "0.1": {
    "r": 75,
    "eff_lo": 0.8834104623487725,
-   "eff_hi": 0.8842940425511334,
-   "verdict": "non-uniform (go to step 4)"
+   "eff_hi": 0.8842940425511334
   },
   "10.0": {
    "r": 74,
    "eff_lo": 0.8888822107596815,
-   "eff_hi": 0.8897693795017856,
-   "verdict": "non-uniform (go to step 4)"
+   "eff_hi": 0.8897693795017856
   }
  },
  "p_opt_bins": [
@@ -90,6 +80,6 @@
   "argmax": 57344
  },
  "min_coverage_before_clip": 0.0,
- "peak_rss_mib": 422.828125,
- "seconds": 305.0989730358124
+ "peak_rss_mib": 455.546875,
+ "seconds": 4356.416233778
 }

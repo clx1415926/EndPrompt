@@ -53,7 +53,6 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
 
-# ------------------ (DataCollatorForSupervisedDataset 保持不变) ------------------
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
@@ -84,7 +83,6 @@ class DataCollatorForSupervisedDataset(object):
             position_ids=position_ids,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-# ---------------------------------------------------------------------------------
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -115,6 +113,7 @@ def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, s
     input_ids = example['input_ids']
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.tolist()
+    n_real = min(len(input_ids), context_length)
     if len(input_ids) < context_length:
         input_ids = input_ids + [pad_id] * (context_length - len(input_ids))
     context = input_ids[:context_length]
@@ -126,9 +125,11 @@ def preprocess_et(example, idx, cue_ids, context_length, pad_id, final_pos_id, s
     assert 0 <= delta <= delta_max, f"采样的偏移越界: delta={delta}, delta_max={delta_max}"
 
     seq = context + list(cue_ids)
+    # 填充位不作为预测目标, 只有真实 context token 与 cue token 计入损失
+    labels = context[:n_real] + [IGNORE_INDEX] * (context_length - n_real) + list(cue_ids)
     position_ids = list(range(context_length))
     position_ids.extend(range(context_length + delta, context_length + delta + b))
-    return {"input_ids": seq, "labels": seq, "position_ids": position_ids}
+    return {"input_ids": seq, "labels": labels, "position_ids": position_ids}
 # ---------------------------------------------------------------
 
 

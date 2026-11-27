@@ -60,7 +60,7 @@ For a new (model, L, s, a, b) configuration, recompute the offset table offline:
 
 ```bash
 cd skip_design
-python gate1_doptimal.py --a0 8182 --b 10 --wcue 1.0 --rank_sensitivity --out_prefix gate1_w1
+python gate1_doptimal.py --a0 8182 --b 10 --rank_sensitivity --out_prefix gate1_w1
 ```
 
 Training samples offsets via `delta = np.searchsorted(cdf, u, side="right")`.
